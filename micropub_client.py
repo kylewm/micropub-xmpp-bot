@@ -92,16 +92,21 @@ class MicropubBot(sleekxmpp.ClientXMPP):
         args = None
         for cmdname, argnames, desc, aliases in commands:
             if trycmd == cmdname or trycmd in aliases:
-                split = tail.split(maxsplit=len(argnames))
-                if len(split) < len(argnames):
-                    msg.reply('I need a little more information. Try "%s %s", or "help" for a list of all commands.' % (
-                        cmdname, ' '.join('[%s]' % a for a in argnames))).send()
-                    return
                 cmd = cmdname
-                args = dict(zip(argnames, split))
+                if not argnames:
+                    args = {}
+                else:
+                    split = tail.split(maxsplit=len(argnames) - 1)
+                    if len(split) < len(argnames):
+                        msg.reply(
+                            'I need a little more information. Try "%s %s", or "help" for a list of all commands.' % (
+                                cmdname, ' '.join('[%s]' % a for a in argnames))
+                        ).send()
+                        return
+                    args = dict(zip(argnames, split))
                 break
 
-        if cmd is None or args is None:
+        if not cmd:
             msg.reply("I didn't understand %s. Try \"help\" for a list of commands" % trycmd).send()
             return
 
@@ -233,15 +238,15 @@ class MicropubBot(sleekxmpp.ClientXMPP):
         token = user_info.get('token')
         micropub = user_info.get('micropub')
 
-        resp = requests.post(micropub, data={
-            'access_token': token,
-        } + payload)
+        data = {'access_token': token}
+        data.update(payload)
+        resp = requests.post(micropub, data=data)
 
         if resp.status_code == 201 or resp.status_code == 202:
             location = resp.headers.get('Location')
             return "Success! %s" % location
         else:
-            return "Something went wrong! (%s: %s)" % (resp, resp.text)
+            return "Something went wrong! %s: %s" % (resp, resp.text)
 
     def do_whois(self, url):
         parsed = mf2py.parse(url=url)
