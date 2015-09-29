@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import re
-import sys
 import unicodedata
 import urllib.parse
 import uuid
@@ -14,7 +13,6 @@ import uuid
 from optparse import OptionParser
 import sleekxmpp
 import mf2py
-import mf2util
 import requests
 
 
@@ -68,14 +66,17 @@ class MicropubBot(sleekxmpp.ClientXMPP):
         user_info = load_user_info(jid)
 
         commands = [
-            ('help', [], 'Display this message', []),
+            ('help', [], 'Display this message', ['h']),
+            ('aliases', [], 'Display a list of aliases for each command', []),
             ('connect', ['url'], 'Start micropub authorization with the given URL', ['open', 'login']),
             ('whoami', [], 'Display information about the currently authorized user', ['me']),
             ('whois', ['url'], 'Get information about a person based on their URL', ['who']),
-            ('post', ['text'], 'Create a new note post via Micropub', ['publish']),
-            ('reply', ['url', 'text'], 'Create a new reply post via Micropub', []),
-            ('like', ['url'], 'Create a new like post via Micropub', ['favorite', 'fave', 'fav']),
+            ('post', ['text'], 'Create a new note post via Micropub', ['publish', 'p']),
+            ('reply', ['url', 'text'], 'Create a new reply post via Micropub', ['re']),
+            ('like', ['url'], 'Create a new like post via Micropub', ['favorite', 'fave', 'fav', '<3']),
             ('repost', ['url'], 'Create a new repost via Micropub', ['share']),
+            ('targets', [], 'List the syndication targets for your currently logged in user.', []),
+            ('syndicate', ['url'], 'Toggle syndication on/off for a particular target (partial name of the target, e.g. "twitter", is fine)', ['synd', 'sy']),
         ]
 
         # next message is the auth code
@@ -116,6 +117,13 @@ class MicropubBot(sleekxmpp.ClientXMPP):
                     cmdname, ' '.join('[%s]' % a for a in argnames), desc
                 ) for cmdname, argnames, desc, aliases in commands
             )
+
+        elif cmd == 'aliases':
+            reply = 'Here are the aliases for each command\n  ' + '\n  '.join(
+                '%s - %s' % (cmdname, ', '.join(aliases))
+                for cmdname, argnames, desc, aliases in commands
+            )
+
         elif cmd == 'whois':
             reply = self.do_whois(normalize_url(args['url']))
 
@@ -128,6 +136,22 @@ class MicropubBot(sleekxmpp.ClientXMPP):
                 reply = "You are currently logged in as %(me)s, with micropub endpoint %(micropub)s" % user_info
             else:
                 reply = "You aren't currently logged in! Use \"connect\" to get started."
+
+        elif cmd == 'targets':
+            syndicate_to = user_info.get('syndicate-to')
+            if syndicate_to:
+                reply = "Here are your syndication targets:\n  " + '\n  '.join(
+                    '%s: %s' % (key, 'on' if value else 'off')
+                    for key, value in syndicate_to.items())
+            else:
+                reply = (
+                    "I don't know about any syndication targets for your "
+                    "micropub endpoint. See See https://indiewebcamp.com/Micropub#Syndication_Targets "
+                    "for more info and then re-connect to refresh your list of "
+                    "targets.")
+
+        elif cmd == 'syndicate':
+            reply = self.do_set_syndication(jid, user_info, args['url'])
 
         elif cmd == 'post':
             reply = self.do_publish(jid, user_info, {
@@ -226,21 +250,72 @@ class MicropubBot(sleekxmpp.ClientXMPP):
         elif 'access_token' not in data:
             reply = 'Token endpoint did not include "access_token" in its response'
         else:
-            user_info['me'] = data['me'][0]
+            me = data['me'][0]
+            token = data['access_token'][0]
+            user_info['me'] = me
             user_info['micropub'] = micropub_endpt
-            user_info['token'] = data['access_token'][0]
+            user_info['token'] = token
             reply = "Saved an access token for %s! We're ready to roll." % me
+
+            self.update_syndicate_to(user_info)
 
         save_user_info(jid, user_info)
         return reply
+
+    def update_syndicate_to(self, user_info):
+        resp = requests.get(user_info['micropub'], params={
+            'q': 'syndicate-to',
+        }, headers={
+            'Authorization': 'Bearer ' + user_info['token'],
+        })
+        if resp.status_code // 100 != 2:
+            logging.warn(
+                'Unexpected response querying micropub endpoint %s: %s',
+                resp, resp.text)
+        else:
+            prev = user_info.get('syndicate-to', {})
+            urls = urllib.parse.parse_qs(resp.text).get('syndicate-to[]', [])
+            user_info['syndicate-to'] = {}
+            for url in urls:
+                user_info['syndicate-to'][url] = prev.get(url, False)
+
+    def do_set_syndication(self, jid, user_info, url):
+        syndicate_to = user_info.setdefault('syndicate-to', {})
+        if not syndicate_to:
+            return ("I don't know any syndication targets for your endpoint. "
+                    "See https://indiewebcamp.com/Micropub#Syndication_Targets. "
+                    "Re-connect to refresh the list of targets.")
+
+        targets = [key for key in syndicate_to if url.lower() in key.lower()]
+        if not targets:
+            return ("%s didn't match any of the syndication targets for your "
+                    "micropub endpoint: %s" % (url, ','.join(syndicate_to)))
+
+        if len(targets) > 1:
+            return ("%s matched more than one syndication target: %s. "
+                    "Can you be more specific?" % (url, ','.join(targets)))
+
+        # toggle
+        newval = not syndicate_to.get(targets[0], False)
+        syndicate_to[targets[0]] = newval
+        save_user_info(jid, user_info)
+        return ("Syndication for %s is now %s." % (
+            targets[0], 'on' if newval else 'off'))
 
     def do_publish(self, jid, user_info, payload):
         token = user_info.get('token')
         micropub = user_info.get('micropub')
 
-        data = {'access_token': token}
+        data = {
+            'syndicate-to[]': [
+                target for target, value in
+                user_info.get('syndicate-to', {}).items() if value
+            ],
+        }
         data.update(payload)
-        resp = requests.post(micropub, data=data)
+        resp = requests.post(micropub, data=data, headers={
+            'Authorization': 'Bearer ' + token,
+        })
 
         if resp.status_code == 201 or resp.status_code == 202:
             location = resp.headers.get('Location')
